@@ -1,0 +1,21 @@
+[package]
+name = "cx-manager"
+version = "0.1.2"
+description = "Desktop manager for Codex PowerShell helpers"
+authors = ["CX-Manager contributors"]
+edition = "2021"
+
+[lib]
+name = "cx_manager_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tempfile = "3"
