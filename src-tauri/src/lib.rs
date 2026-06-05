@@ -8,6 +8,9 @@ use std::process::Command;
 
 const SETTINGS_FILE: &str = "settings.json";
 const DEFAULT_PROXY_URL: &str = "http://10.20.34.92:7890";
+const MANAGED_BLOCK_START: &str = "# >>> CX-Manager managed profile";
+const MANAGED_BLOCK_END: &str = "# <<< CX-Manager managed profile";
+const LEGACY_HELPERS_HEADER: &str = "# CX-Manager default terminal helpers";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -304,17 +307,6 @@ fn build_proxy_block(proxy_url: &str) -> String {
     )
 }
 
-fn update_proxy_block(content: &str, proxy_url: &str) -> String {
-    let block = build_proxy_block(proxy_url);
-    let re = Regex::new(r#"(?m)^\s*\$CX_MANAGER_PROXY_URL\s*=\s*(?:"(?:`.|[^"])*"|[^\r\n]*)"#)
-        .expect("valid regex");
-    if re.is_match(content) {
-        re.replace(content, regex::NoExpand(&block)).to_string()
-    } else {
-        format!("{block}\n\n{content}")
-    }
-}
-
 fn build_project_roots_block(project_roots: &[String]) -> String {
     let mut lines = vec!["$CX_MANAGER_PROJECT_ROOTS = @(".to_string()];
     for root in normalized_project_roots(project_roots) {
@@ -322,16 +314,6 @@ fn build_project_roots_block(project_roots: &[String]) -> String {
     }
     lines.push(")".to_string());
     lines.join("\n")
-}
-
-fn update_project_roots_block(content: &str, project_roots: &[String]) -> String {
-    let block = build_project_roots_block(project_roots);
-    let re = Regex::new(r"(?s)\$CX_MANAGER_PROJECT_ROOTS\s*=\s*@\((?:.*?)\)").expect("valid regex");
-    if re.is_match(content) {
-        re.replace(content, regex::NoExpand(&block)).to_string()
-    } else {
-        format!("{block}\n\n{content}")
-    }
 }
 
 fn default_function_source(function_name: &str) -> Option<&'static str> {
@@ -450,25 +432,64 @@ const DEFAULT_TERMINAL_FUNCTION_NAMES: &[&str] = &[
     "cx",
 ];
 
-fn ensure_default_profile_functions(content: &str) -> String {
-    let mut updated = content.to_string();
-    let mut missing_sources = Vec::new();
+fn build_managed_profile_block(
+    proxy_url: &str,
+    project_roots: &[String],
+    user_content: &str,
+) -> String {
+    let mut sections = vec![
+        MANAGED_BLOCK_START.to_string(),
+        build_proxy_block(proxy_url),
+        build_project_roots_block(project_roots),
+    ];
 
     for function_name in DEFAULT_TERMINAL_FUNCTION_NAMES {
-        if !has_powershell_function(&updated, function_name) {
+        if !has_powershell_function(user_content, function_name) {
             if let Some(source) = default_function_source(function_name) {
-                missing_sources.push(source);
+                sections.push(source.to_string());
             }
         }
     }
 
-    if !missing_sources.is_empty() {
-        updated.push_str("\n\n# CX-Manager default terminal helpers\n");
-        updated.push_str(&missing_sources.join("\n\n"));
-        updated.push('\n');
-    }
+    sections.push(MANAGED_BLOCK_END.to_string());
+    sections.join("\n\n")
+}
 
-    updated
+fn strip_marked_managed_blocks(content: &str) -> String {
+    let pattern = format!(
+        r"(?s)(?:\r?\n)?{}\r?\n.*?\r?\n{}(?:\r?\n)?",
+        regex::escape(MANAGED_BLOCK_START),
+        regex::escape(MANAGED_BLOCK_END)
+    );
+    Regex::new(&pattern)
+        .expect("valid regex")
+        .replace_all(content, "\n")
+        .to_string()
+}
+
+fn strip_legacy_managed_values(content: &str) -> String {
+    let proxy_re =
+        Regex::new(r#"(?m)^\s*\$CX_MANAGER_PROXY_URL\s*=\s*(?:"(?:`.|[^"])*"|[^\r\n]*)(?:\r?\n)?"#)
+            .expect("valid regex");
+    let without_proxy = proxy_re.replace_all(content, "").to_string();
+    let roots_re =
+        Regex::new(r"(?s)(?:\r?\n)?\$CX_MANAGER_PROJECT_ROOTS\s*=\s*@\((?:.*?)\)(?:\r?\n)?")
+            .expect("valid regex");
+    roots_re.replace_all(&without_proxy, "\n").to_string()
+}
+
+fn strip_legacy_helper_block(content: &str) -> String {
+    if let Some(index) = content.find(LEGACY_HELPERS_HEADER) {
+        content[..index].trim_end().to_string()
+    } else {
+        content.to_string()
+    }
+}
+
+fn strip_existing_cxmanager_blocks(content: &str) -> String {
+    let without_marked = strip_marked_managed_blocks(content);
+    let without_legacy_values = strip_legacy_managed_values(&without_marked);
+    strip_legacy_helper_block(&without_legacy_values)
 }
 
 fn sanitize_profile_content(content: &str) -> String {
@@ -477,32 +498,39 @@ fn sanitize_profile_content(content: &str) -> String {
 
 fn build_profile_content(content: &str, proxy_url: &str, project_roots: &[String]) -> String {
     let sanitized = sanitize_profile_content(content);
-    let with_proxy = update_proxy_block(&sanitized, proxy_url);
-    let with_project_roots = update_project_roots_block(&with_proxy, project_roots);
-    ensure_default_profile_functions(&with_project_roots)
+    let user_content = strip_existing_cxmanager_blocks(&sanitized);
+    let managed_block = build_managed_profile_block(proxy_url, project_roots, &user_content);
+    let trimmed_user_content = user_content.trim_start_matches(['\r', '\n']);
+    if trimmed_user_content.trim().is_empty() {
+        format!("{managed_block}\n")
+    } else {
+        format!("{managed_block}\n\n{trimmed_user_content}")
+    }
 }
 
 fn read_profile(path: &Path) -> Result<String, String> {
     if path.exists() {
-        fs::read_to_string(path).map_err(|err| format!("读取 Profile 失败: {err}"))
+        fs::read_to_string(path)
+            .map(|content| content.trim_start_matches('\u{feff}').to_string())
+            .map_err(|err| format!("读取 Profile 失败: {err}"))
     } else {
         Ok(String::new())
     }
 }
 
-fn validate_powershell_syntax(content: &str) -> Result<(), String> {
+fn profile_file_bytes(content: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(3 + content.len());
+    bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+    bytes.extend_from_slice(content.as_bytes());
+    bytes
+}
+
+fn validate_powershell_file_syntax(path: &Path) -> Result<(), String> {
     if !cfg!(target_os = "windows") {
         return Ok(());
     }
 
-    let temp_dir = tempfile::tempdir().map_err(|err| format!("创建临时目录失败: {err}"))?;
-    let temp_path = temp_dir.path().join("profile.ps1");
-    let mut bytes = Vec::with_capacity(3 + content.len());
-    bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
-    bytes.extend_from_slice(content.as_bytes());
-    fs::write(&temp_path, bytes).map_err(|err| format!("写入临时 Profile 失败: {err}"))?;
-
-    let path = ps_single_quote_escape(&temp_path.to_string_lossy());
+    let path = ps_single_quote_escape(&path.to_string_lossy());
     let command = format!(
         "$errors = $null; $null = [System.Management.Automation.Language.Parser]::ParseFile('{path}', [ref]$null, [ref]$errors); if ($errors) {{ $errors | ForEach-Object {{ Write-Output $_.ToString() }} }} else {{ Write-Output 'OK' }}"
     );
@@ -525,12 +553,60 @@ fn validate_powershell_syntax(content: &str) -> Result<(), String> {
     }
 }
 
+fn validate_powershell_syntax(content: &str) -> Result<(), String> {
+    if !cfg!(target_os = "windows") {
+        return Ok(());
+    }
+
+    let temp_dir = tempfile::tempdir().map_err(|err| format!("创建临时目录失败: {err}"))?;
+    let temp_path = temp_dir.path().join("profile.ps1");
+    fs::write(&temp_path, profile_file_bytes(content))
+        .map_err(|err| format!("写入临时 Profile 失败: {err}"))?;
+    validate_powershell_file_syntax(&temp_path)
+}
+
+fn backup_profile_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Microsoft.PowerShell_profile.ps1".to_string());
+    path.with_file_name(format!("{file_name}.cxmanager.bak"))
+}
+
+fn temp_profile_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Microsoft.PowerShell_profile.ps1".to_string());
+    path.with_file_name(format!(".{file_name}.cxmanager.{}.tmp", std::process::id()))
+}
+
 fn write_validated_profile(path: &Path, content: &str) -> Result<(), String> {
     validate_powershell_syntax(content)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("创建 Profile 目录失败: {err}"))?;
     }
-    fs::write(path, content).map_err(|err| format!("写入 Profile 失败: {err}"))
+    let temp_path = temp_profile_path(path);
+    if temp_path.exists() {
+        fs::remove_file(&temp_path).map_err(|err| format!("清理临时 Profile 失败: {err}"))?;
+    }
+    fs::write(&temp_path, profile_file_bytes(content))
+        .map_err(|err| format!("写入临时 Profile 失败: {err}"))?;
+    validate_powershell_file_syntax(&temp_path)?;
+
+    let backup_path = backup_profile_path(path);
+    let had_existing_profile = path.exists();
+    if had_existing_profile {
+        fs::copy(path, &backup_path).map_err(|err| format!("备份 Profile 失败: {err}"))?;
+        fs::remove_file(path).map_err(|err| format!("准备替换 Profile 失败: {err}"))?;
+    }
+
+    fs::rename(&temp_path, path).map_err(|err| {
+        if had_existing_profile && !path.exists() && backup_path.exists() {
+            let _ = fs::copy(&backup_path, path);
+        }
+        format!("替换 Profile 失败: {err}")
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1117,6 +1193,55 @@ mod tests {
         assert!(second.contains("$CX_MANAGER_PROXY_URL = \"http://127.0.0.1:7890\""));
         assert!(second.contains("\"D:\\Work\""));
         assert!(!second.contains("\"C:\\Code\""));
+    }
+
+    #[test]
+    fn truncated_legacy_helper_block_is_discarded_before_rebuild() {
+        let content = "Write-Host \"before\"\n\n# CX-Manager default terminal helpers\nfunction proxy {\n";
+        let updated = build_profile_content(content, DEFAULT_PROXY_URL, &[]);
+
+        assert!(updated.contains("Write-Host \"before\""));
+        assert!(updated.contains("# >>> CX-Manager managed profile"));
+        assert!(updated.contains("# <<< CX-Manager managed profile"));
+        assert_eq!(updated.matches("function proxy").count(), 1);
+        validate_powershell_syntax(&updated).expect("rebuilt profile should parse");
+    }
+
+    #[test]
+    fn legacy_helper_block_is_replaced_instead_of_preserved() {
+        let content = r#"function proxy {
+    Write-Host "old proxy"
+}
+
+# CX-Manager default terminal helpers
+function Show-CXMenu {
+    Write-Host "old menu"
+}
+"#;
+        let updated = build_profile_content(content, DEFAULT_PROXY_URL, &[]);
+
+        assert!(updated.contains("Write-Host \"old proxy\""));
+        assert!(!updated.contains("Write-Host \"old menu\""));
+        assert!(updated.contains("# >>> CX-Manager managed profile"));
+        assert_eq!(updated.matches("# CX-Manager default terminal helpers").count(), 0);
+        validate_powershell_syntax(&updated).expect("rebuilt profile should parse");
+    }
+
+    #[test]
+    fn writing_existing_profile_creates_backup_before_replace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("Microsoft.PowerShell_profile.ps1");
+        let original = "Write-Host \"original\"\n";
+        let replacement = "Write-Host \"replacement\"\n";
+        fs::write(&path, original).expect("write original");
+
+        write_validated_profile(&path, replacement).expect("write replacement");
+
+        assert_eq!(read_profile(&path).expect("read profile"), replacement);
+        assert_eq!(
+            fs::read_to_string(backup_profile_path(&path)).expect("read backup"),
+            original
+        );
     }
 
     #[test]

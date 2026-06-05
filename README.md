@@ -33,7 +33,15 @@ C:\Users\<your-name>\PycharmProjects
 . $PROFILE
 ```
 
-首次启动和保存时，CX-Manager 会检查当前目标 Shell 的 PowerShell Profile。如果缺少必要配置，会自动追加默认实现；如果你已经写过同名函数，CX-Manager 不会覆盖。
+首次启动和保存时，CX-Manager 会检查当前目标 Shell 的 PowerShell Profile。如果缺少必要配置，会自动追加默认实现；如果你已经写过同名函数，CX-Manager 不会覆盖。写入前会先做 PowerShell 语法检查，并在同目录保留一份 `.cxmanager.bak` 备份。
+
+如果 Profile 已经损坏，先用不加载 Profile 的方式打开 PowerShell：
+
+```powershell
+pwsh -NoProfile
+```
+
+然后检查 `$PROFILE` 指向的文件，或者用同目录的 `.cxmanager.bak` 备份恢复。
 
 ## 终端命令用法
 
