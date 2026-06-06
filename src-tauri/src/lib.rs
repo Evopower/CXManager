@@ -1124,23 +1124,98 @@ fn run_command_stdout_with_proxy(
     Ok(stdout)
 }
 
-fn executable_paths(command: &str) -> Vec<String> {
-    if cfg!(target_os = "windows") {
-        run_command_stdout("where.exe", &[command])
-            .map(|stdout| {
-                stdout
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .map(ToOwned::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default()
-    } else {
-        run_command_stdout("which", &[command])
-            .map(|stdout| vec![stdout])
-            .unwrap_or_default()
+fn push_unique_path(paths: &mut Vec<String>, path: impl Into<String>) {
+    let path = path.into();
+    if path.trim().is_empty() {
+        return;
     }
+    if !paths
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&path))
+    {
+        paths.push(path);
+    }
+}
+
+fn npm_global_prefix() -> Option<PathBuf> {
+    run_command_stdout("npm", &["prefix", "-g"])
+        .ok()
+        .map(|prefix| prefix.trim().to_string())
+        .filter(|prefix| !prefix.is_empty())
+        .map(PathBuf::from)
+}
+
+fn npm_global_command_candidates(command: &str, prefix: &Path) -> Vec<PathBuf> {
+    if cfg!(target_os = "windows") {
+        vec![
+            prefix.join(format!("{command}.cmd")),
+            prefix.join(format!("{command}.exe")),
+            prefix.join(format!("{command}.bat")),
+            prefix.join(format!("{command}.com")),
+            prefix.join(command),
+            prefix.join(format!("{command}.ps1")),
+        ]
+    } else {
+        vec![prefix.join("bin").join(command), prefix.join(command)]
+    }
+}
+
+fn npm_global_executable_paths(command: &str) -> Vec<String> {
+    npm_global_prefix()
+        .map(|prefix| {
+            npm_global_command_candidates(command, &prefix)
+                .into_iter()
+                .filter(|path| path.is_file())
+                .map(|path| path.to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn executable_paths(command: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    if cfg!(target_os = "windows") {
+        if let Ok(stdout) = run_command_stdout("where.exe", &[command]) {
+            for line in stdout
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+            {
+                push_unique_path(&mut paths, line);
+            }
+        }
+    } else {
+        if let Ok(stdout) = run_command_stdout("which", &[command]) {
+            for line in stdout
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+            {
+                push_unique_path(&mut paths, line);
+            }
+        }
+    }
+    for path in npm_global_executable_paths(command) {
+        push_unique_path(&mut paths, path);
+    }
+    paths
+}
+
+fn preferred_executable_path<'a>(command: &'a str, executable_paths: &'a [String]) -> &'a str {
+    if executable_paths.is_empty() {
+        return command;
+    }
+    if cfg!(target_os = "windows") {
+        for extension in [".cmd", ".exe", ".bat", ".com"] {
+            if let Some(path) = executable_paths
+                .iter()
+                .find(|path| path.to_ascii_lowercase().ends_with(extension))
+            {
+                return path;
+            }
+        }
+    }
+    executable_paths[0].as_str()
 }
 
 fn tool_status(name: &str, command: &str, version_args: &[&str]) -> ToolStatus {
@@ -1155,7 +1230,8 @@ fn tool_status(name: &str, command: &str, version_args: &[&str]) -> ToolStatus {
         };
     }
 
-    match run_command_stdout(command, version_args) {
+    let version_command = preferred_executable_path(command, &executable_paths);
+    match run_command_stdout(version_command, version_args) {
         Ok(version_output) => ToolStatus {
             installed: true,
             version: Some(version_output.trim().to_string()),
@@ -1185,7 +1261,8 @@ fn local_codex_result() -> Result<(String, Vec<String>), String> {
     if paths.is_empty() {
         return Err("未找到 codex 可执行文件，请先安装 Codex CLI".to_string());
     }
-    let version_output = run_command_stdout("codex", &["--version"])?;
+    let version_output =
+        run_command_stdout(preferred_executable_path("codex", &paths), &["--version"])?;
     Ok((version_output, paths))
 }
 
@@ -1435,6 +1512,9 @@ pub fn run() {
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::Mutex;
+
+    static NPM_PREFIX_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn default_settings_use_current_proxy() {
@@ -1616,7 +1696,8 @@ mod tests {
 
     #[test]
     fn truncated_legacy_helper_block_is_discarded_before_rebuild() {
-        let content = "Write-Host \"before\"\n\n# CX-Manager default terminal helpers\nfunction proxy {\n";
+        let content =
+            "Write-Host \"before\"\n\n# CX-Manager default terminal helpers\nfunction proxy {\n";
         let updated = build_profile_content(content, DEFAULT_PROXY_URL, &[]);
 
         assert!(updated.contains("Write-Host \"before\""));
@@ -1642,7 +1723,12 @@ function Show-CXMenu {
         assert!(updated.contains("Write-Host \"old proxy\""));
         assert!(!updated.contains("Write-Host \"old menu\""));
         assert!(updated.contains("# >>> CX-Manager managed profile"));
-        assert_eq!(updated.matches("# CX-Manager default terminal helpers").count(), 0);
+        assert_eq!(
+            updated
+                .matches("# CX-Manager default terminal helpers")
+                .count(),
+            0
+        );
         validate_powershell_syntax(&updated).expect("rebuilt profile should parse");
     }
 
@@ -1808,6 +1894,68 @@ function Show-CXMenu {
         }
     }
 
+    #[test]
+    fn executable_paths_include_npm_global_shim_when_path_lookup_misses() {
+        let _guard = NPM_PREFIX_LOCK.lock().expect("npm prefix lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let prefix = temp.path().join("npm prefix with space");
+        fs::create_dir_all(&prefix).expect("create npm prefix");
+        let command = "cxmanager-test-codex";
+        let shim = if cfg!(target_os = "windows") {
+            prefix.join(format!("{command}.cmd"))
+        } else {
+            let bin = prefix.join("bin");
+            fs::create_dir_all(&bin).expect("create npm bin dir");
+            bin.join(command)
+        };
+        fs::write(&shim, "").expect("create fake npm global shim");
+        let previous_prefix = env::var_os("NPM_CONFIG_PREFIX");
+        env::set_var("NPM_CONFIG_PREFIX", &prefix);
+
+        let paths = executable_paths(command);
+
+        match previous_prefix {
+            Some(value) => env::set_var("NPM_CONFIG_PREFIX", value),
+            None => env::remove_var("NPM_CONFIG_PREFIX"),
+        }
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.eq_ignore_ascii_case(&shim.to_string_lossy())),
+            "expected npm global shim path in {paths:?}"
+        );
+    }
+
+    #[test]
+    fn tool_status_uses_detected_npm_global_shim_for_version_check() {
+        if !cfg!(target_os = "windows") {
+            return;
+        }
+
+        let _guard = NPM_PREFIX_LOCK.lock().expect("npm prefix lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let prefix = temp.path().join("npm prefix with space");
+        fs::create_dir_all(&prefix).expect("create npm prefix");
+        let command = "cxmanager-test-codex-version";
+        let shim = prefix.join(format!("{command}.cmd"));
+        fs::write(&shim, "@echo 0.137.0\r\n").expect("create fake npm global shim");
+        let previous_prefix = env::var_os("NPM_CONFIG_PREFIX");
+        env::set_var("NPM_CONFIG_PREFIX", &prefix);
+
+        let status = tool_status("Codex", command, &["--version"]);
+
+        match previous_prefix {
+            Some(value) => env::set_var("NPM_CONFIG_PREFIX", value),
+            None => env::remove_var("NPM_CONFIG_PREFIX"),
+        }
+        assert!(status.installed, "{status:?}");
+        assert_eq!(status.version.as_deref(), Some("0.137.0"));
+        assert!(status
+            .executable_paths
+            .iter()
+            .any(|path| path.eq_ignore_ascii_case(&shim.to_string_lossy())));
+    }
+
     fn tool_status_for_test(installed: bool, name: &str) -> ToolStatus {
         ToolStatus {
             installed,
@@ -1844,8 +1992,9 @@ function Show-CXMenu {
     #[test]
     fn install_completion_messages_explain_failed_post_install_detection() {
         let npm_without_codex = runtime_status_for_test(true, None);
-        assert!(codex_install_completion_message(&npm_without_codex)
-            .contains("仍未检测到 Codex CLI"));
+        assert!(
+            codex_install_completion_message(&npm_without_codex).contains("仍未检测到 Codex CLI")
+        );
         assert!(codex_install_completion_message(&npm_without_codex).contains("PATH"));
 
         let no_npm = runtime_status_for_test(false, None);
