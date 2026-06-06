@@ -376,6 +376,51 @@ fn build_project_roots_block(project_roots: &[String]) -> String {
     lines.join("\n")
 }
 
+fn build_tool_paths_block() -> &'static str {
+    r#"function Add-CXManagerToolPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $normalizedPath = $Path.TrimEnd('\')
+    $existingPaths = @($env:Path -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    foreach ($existingPath in $existingPaths) {
+        if ($existingPath.TrimEnd('\') -ieq $normalizedPath) { return }
+    }
+    if ([string]::IsNullOrWhiteSpace($env:Path)) {
+        $env:Path = $Path
+    } else {
+        $env:Path = "$Path;$env:Path"
+    }
+}
+
+$cxNpmPrefix = $null
+try {
+    $cxNpmCommand = Get-Command npm -CommandType Application -ErrorAction Stop
+    $cxNpmPrefix = & $cxNpmCommand.Source prefix -g
+    if ($LASTEXITCODE -ne 0) { $cxNpmPrefix = $null }
+} catch {
+    $cxNpmPrefix = $null
+}
+
+if ($cxNpmPrefix) {
+    $cxNpmPrefix = @($cxNpmPrefix | Select-Object -First 1)[0].ToString().Trim()
+    Add-CXManagerToolPath $cxNpmPrefix
+    Add-CXManagerToolPath (Join-Path $cxNpmPrefix "bin")
+}
+if ($env:ProgramFiles) {
+    Add-CXManagerToolPath (Join-Path $env:ProgramFiles "nodejs")
+}
+if (${env:ProgramFiles(x86)}) {
+    Add-CXManagerToolPath (Join-Path ${env:ProgramFiles(x86)} "nodejs")
+}
+if ($env:APPDATA) {
+    Add-CXManagerToolPath (Join-Path $env:APPDATA "npm")
+}
+if ($env:LOCALAPPDATA) {
+    Add-CXManagerToolPath (Join-Path $env:LOCALAPPDATA "Programs\nodejs")
+}"#
+}
+
 fn default_function_source(function_name: &str) -> Option<&'static str> {
     match function_name {
         "proxy" => Some(
@@ -451,6 +496,24 @@ fn default_function_source(function_name: &str) -> Option<&'static str> {
     }
 }"#,
         ),
+        "Resolve-CXManagerCodexCommand" => Some(
+            r#"function Resolve-CXManagerCodexCommand {
+    foreach ($command in @("codex.cmd", "codex.exe", "codex.bat", "codex.com", "codex")) {
+        try {
+            $resolved = Get-Command $command -CommandType Application -ErrorAction Stop
+            if ($resolved.Source) { return $resolved.Source }
+        } catch {
+        }
+    }
+    return "codex"
+}"#,
+        ),
+        "Invoke-CXManagerCodex" => Some(
+            r#"function Invoke-CXManagerCodex {
+    $command = Resolve-CXManagerCodexCommand
+    & $command @args
+}"#,
+        ),
         "cx" => Some(
             r#"function cx {
     $folders = @(Get-CXManagerProjectFolders)
@@ -475,8 +538,8 @@ fn default_function_source(function_name: &str) -> Option<&'static str> {
     }
 
     switch ($modeIndex) {
-        0 { codex -s danger-full-access -a never @args }
-        1 { codex @args }
+        0 { Invoke-CXManagerCodex -s danger-full-access -a never @args }
+        1 { Invoke-CXManagerCodex @args }
     }
 }"#,
         ),
@@ -489,6 +552,8 @@ const DEFAULT_TERMINAL_FUNCTION_NAMES: &[&str] = &[
     "unproxy",
     "Show-CXMenu",
     "Get-CXManagerProjectFolders",
+    "Resolve-CXManagerCodexCommand",
+    "Invoke-CXManagerCodex",
     "cx",
 ];
 
@@ -501,6 +566,7 @@ fn build_managed_profile_block(
         MANAGED_BLOCK_START.to_string(),
         build_proxy_block(proxy_url),
         build_project_roots_block(project_roots),
+        build_tool_paths_block().to_string(),
     ];
 
     for function_name in DEFAULT_TERMINAL_FUNCTION_NAMES {
@@ -1654,6 +1720,22 @@ mod tests {
     }
 
     #[test]
+    fn generated_profile_adds_tool_paths_even_when_user_cx_is_preserved() {
+        let content = build_profile_content(
+            "function cx { codex @args }\n",
+            DEFAULT_PROXY_URL,
+            &["C:\\Users\\Example\\PycharmProjects".to_string()],
+        );
+
+        assert_eq!(content.matches("function cx").count(), 1);
+        assert!(content.contains("function Add-CXManagerToolPath"));
+        assert!(content.contains("function Invoke-CXManagerCodex"));
+        assert!(content.contains("prefix -g"));
+        assert!(content.contains("ProgramFiles"));
+        validate_powershell_syntax(&content).expect("profile with tool path block should parse");
+    }
+
+    #[test]
     fn injects_missing_codex_terminal_helpers() {
         let content = build_profile_content("", DEFAULT_PROXY_URL, &[]);
 
@@ -1662,6 +1744,8 @@ mod tests {
             "unproxy",
             "Show-CXMenu",
             "Get-CXManagerProjectFolders",
+            "Resolve-CXManagerCodexCommand",
+            "Invoke-CXManagerCodex",
             "cx",
         ] {
             assert!(
@@ -1669,6 +1753,7 @@ mod tests {
                 "missing generated helper {function_name}"
             );
         }
+        assert!(content.contains("Invoke-CXManagerCodex -s danger-full-access -a never @args"));
     }
 
     #[test]

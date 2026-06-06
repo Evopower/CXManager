@@ -1,6 +1,6 @@
 [package]
 name = "cx-manager"
-version = "0.1.5"
+version = "0.1.6"
 description = "Desktop manager for Codex PowerShell helpers"
 authors = ["CX-Manager contributors"]
 edition = "2021"
