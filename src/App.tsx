@@ -13,11 +13,12 @@ import {
   Trash2,
   Wrench
 } from "lucide-react";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useState } from "react";
 import appIcon from "./assets/app-icon.svg";
 import { invokeCommand } from "./api";
-import { AppSettings, AppState, CodexStatus, RepairResult, SaveResult, TargetShell, UpdateResult } from "./types";
+import { AppSettings, AppState, CodexStatus, RepairResult, RuntimeStatus, SaveResult, TargetShell, ToolProgressEvent, UpdateResult } from "./types";
 
 const targetShellLabels: Record<TargetShell, string> = {
   auto: "自动",
@@ -29,10 +30,29 @@ function statusClass(ok: boolean) {
   return ok ? "statusPill ok" : "statusPill warn";
 }
 
+function isTauriRuntime() {
+  return "__TAURI_INTERNALS__" in window;
+}
+
 function formatVersion(status: CodexStatus) {
   if (!status.localVersion) return "未检测到";
   if (!status.latestVersion) return status.localVersion;
   return `${status.localVersion} / ${status.latestVersion}`;
+}
+
+function formatToolProgress(event: ToolProgressEvent) {
+  const prefix = event.done
+    ? event.success
+      ? "完成"
+      : "失败"
+    : event.stream === "stderr"
+      ? "ERR"
+      : event.stream === "system"
+        ? "INFO"
+        : "OUT";
+  const message = event.message.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trimEnd();
+  const lines = message.split("\n").filter((line) => line.trim().length > 0);
+  return (lines.length ? lines : [message]).map((line) => `[${prefix}] ${line}`);
 }
 
 export default function App() {
@@ -41,9 +61,41 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("正在加载 CX-Manager");
   const [error, setError] = useState<string | null>(null);
+  const [toolRunning, setToolRunning] = useState<string | null>(null);
+  const [toolLogs, setToolLogs] = useState<string[]>([]);
 
   useEffect(() => {
     void loadState();
+  }, []);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    let active = true;
+    let unlisten: UnlistenFn | null = null;
+
+    listen<ToolProgressEvent>("tool-progress", (event) => {
+      const payload = event.payload;
+      setToolLogs((logs) => [...logs, ...formatToolProgress(payload)].slice(-240));
+      setToolRunning(payload.done ? null : payload.action);
+      if (payload.done && payload.success === false) {
+        setStatus(`${payload.action}失败`);
+      }
+    })
+      .then((handler) => {
+        if (active) {
+          unlisten = handler;
+        } else {
+          handler();
+        }
+      })
+      .catch((err) => {
+        setToolLogs((logs) => [...logs, `[ERR] 无法监听安装日志: ${String(err)}`].slice(-240));
+      });
+
+    return () => {
+      active = false;
+      if (unlisten) unlisten();
+    };
   }, []);
 
   async function loadState() {
@@ -146,19 +198,43 @@ export default function App() {
     }
   }
 
-  async function refreshCodex() {
+  function applyToolResult(result: UpdateResult) {
+    if (!state) return;
+    setState({
+      ...state,
+      toolchainStatus: result.toolchainStatus,
+      codexStatus: result.codexStatus
+    });
+    setStatus(result.message);
+  }
+
+  function beginToolAction(action: string) {
+    setToolRunning(action);
+    setToolLogs([`[INFO] ${action}`]);
+  }
+
+  function appendToolError(err: unknown) {
+    setToolRunning(null);
+    setToolLogs((logs) => [...logs, `[失败] ${String(err)}`].slice(-240));
+  }
+
+  async function refreshRuntime() {
     if (!state) return;
     setBusy(true);
     setError(null);
     try {
-      const codexStatus = await invokeCommand<CodexStatus>("refresh_codex_status", {
-        proxyUrl: state.settings.proxyUrl
+      const runtimeStatus = await invokeCommand<RuntimeStatus>("refresh_runtime_status", {
+        settings: state.settings
       });
-      setState({ ...state, codexStatus });
-      setStatus(codexStatus.message);
+      setState({
+        ...state,
+        toolchainStatus: runtimeStatus.toolchainStatus,
+        codexStatus: runtimeStatus.codexStatus
+      });
+      setStatus(runtimeStatus.codexStatus.message);
     } catch (err) {
       setError(String(err));
-      setStatus("刷新 Codex 状态失败");
+      setStatus("刷新运行环境状态失败");
     } finally {
       setBusy(false);
     }
@@ -168,15 +244,54 @@ export default function App() {
     if (!state) return;
     setBusy(true);
     setError(null);
+    beginToolAction("更新 Codex");
     try {
       const result = await invokeCommand<UpdateResult>("update_codex", {
-        proxyUrl: state.settings.proxyUrl
+        settings: state.settings
       });
-      setState({ ...state, codexStatus: result.codexStatus });
-      setStatus(result.stdout || result.message);
+      applyToolResult(result);
     } catch (err) {
       setError(String(err));
       setStatus("Codex 更新失败");
+      appendToolError(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function installCodex() {
+    if (!state) return;
+    setBusy(true);
+    setError(null);
+    beginToolAction("安装 Codex CLI");
+    try {
+      const result = await invokeCommand<UpdateResult>("install_codex", {
+        settings: state.settings
+      });
+      applyToolResult(result);
+    } catch (err) {
+      setError(String(err));
+      setStatus("Codex 安装失败");
+      appendToolError(err);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function installNodejs() {
+    if (!state) return;
+    setBusy(true);
+    setError(null);
+    beginToolAction("安装 Node.js LTS / npm");
+    try {
+      const result = await invokeCommand<UpdateResult>("install_nodejs", {
+        settings: state.settings
+      });
+      applyToolResult(result);
+    } catch (err) {
+      setError(String(err));
+      setStatus("Node.js / npm 安装失败");
+      appendToolError(err);
     } finally {
       setBusy(false);
     }
@@ -282,12 +397,20 @@ export default function App() {
                 <p className="eyebrow">Codex</p>
                 <h3>{formatVersion(state.codexStatus)}</h3>
               </div>
-              <button onClick={refreshCodex} disabled={busy} title="刷新 Codex 状态">
+              <button onClick={refreshRuntime} disabled={busy} title="刷新运行环境状态">
                 <RefreshCw size={16} />
               </button>
             </div>
 
             <div className="statusRows">
+              <div>
+                <span>Node.js</span>
+                <strong>{state.toolchainStatus.node.version ?? "not found"}</strong>
+              </div>
+              <div>
+                <span>npm</span>
+                <strong>{state.toolchainStatus.npm.version ?? "not found"}</strong>
+              </div>
               <div>
                 <span>本地版本</span>
                 <strong>{state.codexStatus.localVersion ?? "unknown"}</strong>
@@ -304,6 +427,13 @@ export default function App() {
               </div>
             </div>
 
+            {(state.toolchainStatus.node.warning || state.toolchainStatus.npm.warning) && (
+              <div className="notice">
+                <AlertCircle size={16} />
+                <span>{state.toolchainStatus.node.warning ?? state.toolchainStatus.npm.warning}</span>
+              </div>
+            )}
+
             {state.codexStatus.warning && (
               <div className="notice">
                 <AlertCircle size={16} />
@@ -311,11 +441,40 @@ export default function App() {
               </div>
             )}
 
+            {!state.toolchainStatus.npm.installed && (
+              <button className="updateButton" onClick={installNodejs} disabled={busy}>
+                {toolRunning === "安装 Node.js LTS / npm" ? <Loader2 className="spin" size={16} /> : <ChevronRight size={16} />}
+                安装 Node.js LTS / npm
+              </button>
+            )}
+
+            {state.toolchainStatus.npm.installed && !state.codexStatus.localVersion && (
+              <button className="updateButton" onClick={installCodex} disabled={busy}>
+                {toolRunning === "安装 Codex CLI" ? <Loader2 className="spin" size={16} /> : <ChevronRight size={16} />}
+                安装 Codex CLI
+              </button>
+            )}
+
             {state.codexStatus.updateAvailable && (
               <button className="updateButton" onClick={updateCodex} disabled={busy}>
-                <ChevronRight size={16} />
+                {toolRunning === "更新 Codex" ? <Loader2 className="spin" size={16} /> : <ChevronRight size={16} />}
                 更新 Codex
               </button>
+            )}
+
+            {(toolRunning || toolLogs.length > 0) && (
+              <div className="toolLogPanel">
+                <div className="toolLogHeader">
+                  <span>
+                    <Terminal size={15} />
+                    {toolRunning ?? "最近一次安装日志"}
+                  </span>
+                  <button onClick={() => setToolLogs([])} disabled={busy && Boolean(toolRunning)} title="清空日志">
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+                <pre>{toolLogs.join("\n")}</pre>
+              </div>
             )}
           </section>
 
@@ -358,6 +517,15 @@ export default function App() {
             <label>
               <span>Proxy URL</span>
               <input value={state.settings.proxyUrl} onChange={(event) => updateSettings({ proxyUrl: event.target.value })} />
+            </label>
+
+            <label className="checkOption">
+              <input
+                type="checkbox"
+                checked={state.settings.useProxyForTools}
+                onChange={(event) => updateSettings({ useProxyForTools: event.target.checked })}
+              />
+              <span>安装/更新 npm 与 Codex 时使用此代理</span>
             </label>
 
             <div className="projectRootList">

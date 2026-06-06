@@ -3,6 +3,7 @@ export type TargetShell = "auto" | "pwsh" | "powershell";
 export type AppSettings = {
   targetShell: TargetShell;
   proxyUrl: string;
+  useProxyForTools: boolean;
   projectRoots: string[];
 };
 
@@ -33,10 +34,29 @@ export type CodexStatus = {
   message: string;
 };
 
+export type ToolStatus = {
+  installed: boolean;
+  version: string | null;
+  executablePaths: string[];
+  warning: string | null;
+  message: string;
+};
+
+export type ToolchainStatus = {
+  node: ToolStatus;
+  npm: ToolStatus;
+};
+
+export type RuntimeStatus = {
+  toolchainStatus: ToolchainStatus;
+  codexStatus: CodexStatus;
+};
+
 export type AppState = {
   settings: AppSettings;
   shellStatus: ShellStatus;
   profileStatus: ProfileStatus;
+  toolchainStatus: ToolchainStatus;
   codexStatus: CodexStatus;
 };
 
@@ -56,5 +76,14 @@ export type UpdateResult = {
   message: string;
   stdout: string;
   stderr: string;
+  toolchainStatus: ToolchainStatus;
   codexStatus: CodexStatus;
+};
+
+export type ToolProgressEvent = {
+  action: string;
+  stream: "system" | "stdout" | "stderr";
+  message: string;
+  done: boolean;
+  success: boolean | null;
 };

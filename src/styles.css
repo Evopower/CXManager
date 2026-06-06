@@ -90,6 +90,13 @@ select:focus {
   box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.14);
 }
 
+input[type="checkbox"] {
+  width: 16px;
+  min-height: 16px;
+  padding: 0;
+  accent-color: #0f766e;
+}
+
 label {
   display: grid;
   gap: 6px;
@@ -341,6 +348,60 @@ label {
   color: #92400e;
 }
 
+.toolLogPanel {
+  margin-top: 12px;
+  border: 1px solid #d7dee8;
+  border-radius: 8px;
+  background: #101828;
+  color: #e5edf6;
+  overflow: hidden;
+}
+
+.toolLogHeader {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 8px 0 10px;
+  border-bottom: 1px solid rgba(229, 237, 246, 0.12);
+  background: #1d2939;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.toolLogHeader span {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.toolLogHeader button {
+  width: 28px;
+  min-height: 26px;
+  padding: 0;
+  border-color: rgba(229, 237, 246, 0.18);
+  background: transparent;
+  color: #e5edf6;
+}
+
+.toolLogPanel pre {
+  min-height: 118px;
+  max-height: 220px;
+  margin: 0;
+  padding: 10px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: "Cascadia Mono", Consolas, "SFMono-Regular", monospace;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
 .checkList {
   display: grid;
   gap: 9px;
@@ -379,6 +440,20 @@ label {
   display: grid;
   align-content: start;
   gap: 12px;
+}
+
+.checkOption {
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  color: #344054;
+  font-size: 12px;
+}
+
+.checkOption span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .projectRootList {

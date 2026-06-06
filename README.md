@@ -33,6 +33,8 @@ C:\Users\<your-name>\PycharmProjects
 . $PROFILE
 ```
 
+8. 如果界面提示缺少 Node.js / npm 或 Codex CLI，可以在 Codex 面板里一键安装。安装和更新会在应用内显示实时日志；可按需勾选是否使用界面中的代理地址。
+
 首次启动和保存时，CX-Manager 会检查当前目标 Shell 的 PowerShell Profile。如果缺少必要配置，会自动追加默认实现；如果你已经写过同名函数，CX-Manager 不会覆盖。写入前会先做 PowerShell 语法检查，并在同目录保留一份 `.cxmanager.bak` 备份。
 
 如果 Profile 已经损坏，先用不加载 Profile 的方式打开 PowerShell：

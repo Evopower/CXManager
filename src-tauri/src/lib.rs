@@ -1,16 +1,25 @@
+use encoding_rs::GBK;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Sender};
+use std::thread;
+use std::time::Duration;
+use tauri::Emitter;
 
 const SETTINGS_FILE: &str = "settings.json";
 const DEFAULT_PROXY_URL: &str = "http://10.20.34.92:7890";
 const MANAGED_BLOCK_START: &str = "# >>> CX-Manager managed profile";
 const MANAGED_BLOCK_END: &str = "# <<< CX-Manager managed profile";
 const LEGACY_HELPERS_HEADER: &str = "# CX-Manager default terminal helpers";
+const TOOL_PROGRESS_EVENT: &str = "tool-progress";
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -25,6 +34,7 @@ pub enum TargetShell {
 pub struct AppSettings {
     pub target_shell: TargetShell,
     pub proxy_url: String,
+    pub use_proxy_for_tools: bool,
     pub project_roots: Vec<String>,
 }
 
@@ -33,6 +43,7 @@ impl Default for AppSettings {
         Self {
             target_shell: TargetShell::Auto,
             proxy_url: DEFAULT_PROXY_URL.to_string(),
+            use_proxy_for_tools: true,
             project_roots: Vec::new(),
         }
     }
@@ -54,6 +65,7 @@ pub struct AppState {
     pub settings: AppSettings,
     pub shell_status: ShellStatus,
     pub profile_status: ProfileStatus,
+    pub toolchain_status: ToolchainStatus,
     pub codex_status: CodexStatus,
 }
 
@@ -253,28 +265,76 @@ fn current_host_hint() -> Option<String> {
 }
 
 fn command_exists(command: &str) -> bool {
-    Command::new(command)
-        .args([
-            "-NoProfile",
-            "-Command",
-            "$PSVersionTable.PSVersion.ToString()",
-        ])
+    let mut process = Command::new(command);
+    process.args([
+        "-NoProfile",
+        "-Command",
+        "$PSVersionTable.PSVersion.ToString()",
+    ]);
+    apply_hidden_window(&mut process);
+    process
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
 }
 
+fn decode_command_output_raw(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_string();
+    }
+    let (decoded, _, _) = GBK.decode(bytes);
+    decoded.to_string()
+}
+
+fn decode_command_output(bytes: &[u8]) -> String {
+    decode_command_output_raw(bytes).trim().to_string()
+}
+
+fn decode_stream_pending(pending: &mut Vec<u8>, final_chunk: bool) -> Option<String> {
+    if pending.is_empty() {
+        return None;
+    }
+
+    match std::str::from_utf8(pending) {
+        Ok(text) => {
+            let text = text.to_string();
+            pending.clear();
+            Some(text)
+        }
+        Err(err) if err.error_len().is_none() && !final_chunk => {
+            let valid_up_to = err.valid_up_to();
+            if valid_up_to == 0 {
+                return None;
+            }
+            let text = String::from_utf8_lossy(&pending[..valid_up_to]).to_string();
+            let rest = pending[valid_up_to..].to_vec();
+            *pending = rest;
+            Some(text)
+        }
+        Err(_) => {
+            let text = decode_command_output_raw(pending);
+            pending.clear();
+            Some(text)
+        }
+    }
+}
+
 fn read_shell_version(command: &str) -> Result<String, String> {
-    let output = Command::new(command)
-        .args([
-            "-NoProfile",
-            "-Command",
-            "$PSVersionTable.PSVersion.ToString()",
-        ])
+    let mut process = Command::new(command);
+    process.args([
+        "-NoProfile",
+        "-Command",
+        "$PSVersionTable.PSVersion.ToString()",
+    ]);
+    apply_hidden_window(&mut process);
+    let output = process
         .output()
         .map_err(|err| format!("调用 {command} 失败: {err}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = decode_command_output(&output.stdout);
+    let stderr = decode_command_output(&output.stderr);
     if output.status.success() && !stdout.is_empty() {
         Ok(stdout)
     } else if !stderr.is_empty() {
@@ -535,12 +595,14 @@ fn validate_powershell_file_syntax(path: &Path) -> Result<(), String> {
         "$errors = $null; $null = [System.Management.Automation.Language.Parser]::ParseFile('{path}', [ref]$null, [ref]$errors); if ($errors) {{ $errors | ForEach-Object {{ Write-Output $_.ToString() }} }} else {{ Write-Output 'OK' }}"
     );
 
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-Command", &command])
+    let mut process = Command::new("powershell");
+    process.args(["-NoProfile", "-Command", &command]);
+    apply_hidden_window(&mut process);
+    let output = process
         .output()
         .map_err(|err| format!("调用 PowerShell 失败: {err}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = decode_command_output(&output.stdout);
+    let stderr = decode_command_output(&output.stderr);
 
     if output.status.success() && stdout == "OK" {
         Ok(())
@@ -634,6 +696,30 @@ pub struct CodexStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct ToolStatus {
+    pub installed: bool,
+    pub version: Option<String>,
+    pub executable_paths: Vec<String>,
+    pub warning: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolchainStatus {
+    pub node: ToolStatus,
+    pub npm: ToolStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeStatus {
+    pub toolchain_status: ToolchainStatus,
+    pub codex_status: CodexStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct SaveResult {
     pub message: String,
     pub shell_status: ShellStatus,
@@ -654,6 +740,7 @@ pub struct UpdateResult {
     pub message: String,
     pub stdout: String,
     pub stderr: String,
+    pub toolchain_status: ToolchainStatus,
     pub codex_status: CodexStatus,
 }
 
@@ -741,6 +828,48 @@ struct CommandInvocation {
     program: String,
     args: Vec<String>,
     env: Vec<(String, String)>,
+    hide_window: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolProgressEvent {
+    action: String,
+    stream: String,
+    message: String,
+    done: bool,
+    success: Option<bool>,
+}
+
+fn should_hide_command_windows() -> bool {
+    cfg!(target_os = "windows")
+}
+
+fn apply_hidden_window(process: &mut Command) {
+    if should_hide_command_windows() {
+        apply_windows_hidden_window(process);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn apply_windows_hidden_window(process: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    process.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_windows_hidden_window(_process: &mut Command) {}
+
+fn build_invocation_command(invocation: &CommandInvocation) -> Command {
+    let mut process = Command::new(&invocation.program);
+    process.args(&invocation.args);
+    for (key, value) in &invocation.env {
+        process.env(key, value);
+    }
+    if invocation.hide_window {
+        apply_hidden_window(&mut process);
+    }
+    process
 }
 
 fn command_invocation_with_proxy(
@@ -773,13 +902,211 @@ fn command_invocation_with_proxy(
             program: "cmd.exe".to_string(),
             args: shell_args,
             env: proxy_env,
+            hide_window: should_hide_command_windows(),
         }
     } else {
         CommandInvocation {
             program: command.to_string(),
             args: args.iter().map(|arg| (*arg).to_string()).collect(),
             env: proxy_env,
+            hide_window: should_hide_command_windows(),
         }
+    }
+}
+
+fn tool_proxy_url(settings: &AppSettings) -> Option<&str> {
+    if settings.use_proxy_for_tools {
+        let proxy_url = settings.proxy_url.trim();
+        if proxy_url.is_empty() {
+            None
+        } else {
+            Some(proxy_url)
+        }
+    } else {
+        None
+    }
+}
+
+fn install_codex_invocation(proxy_url: Option<&str>) -> CommandInvocation {
+    command_invocation_with_proxy("npm", &["install", "-g", "@openai/codex"], proxy_url)
+}
+
+fn install_nodejs_invocation(proxy_url: Option<&str>) -> CommandInvocation {
+    command_invocation_with_proxy(
+        "winget",
+        &[
+            "install",
+            "--id",
+            "OpenJS.NodeJS.LTS",
+            "-e",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+        ],
+        proxy_url,
+    )
+}
+
+fn run_invocation_output(
+    invocation: &CommandInvocation,
+    command_label: &str,
+) -> Result<(String, String), String> {
+    let output = build_invocation_command(invocation)
+        .output()
+        .map_err(|err| format!("调用 {command_label} 失败: {err}"))?;
+    let stdout = decode_command_output(&output.stdout);
+    let stderr = decode_command_output(&output.stderr);
+    if output.status.success() {
+        Ok((stdout, stderr))
+    } else if !stderr.is_empty() {
+        Err(stderr)
+    } else if !stdout.is_empty() {
+        Err(stdout)
+    } else {
+        Err(format!("{command_label} 执行失败，但没有输出错误详情"))
+    }
+}
+
+fn emit_tool_progress(
+    app: Option<&tauri::AppHandle>,
+    action: &str,
+    stream: &str,
+    message: impl Into<String>,
+    done: bool,
+    success: Option<bool>,
+) {
+    if let Some(app) = app {
+        let _ = app.emit(
+            TOOL_PROGRESS_EVENT,
+            ToolProgressEvent {
+                action: action.to_string(),
+                stream: stream.to_string(),
+                message: message.into(),
+                done,
+                success,
+            },
+        );
+    }
+}
+
+fn read_process_stream<R: Read + Send + 'static>(
+    mut reader: R,
+    stream: &'static str,
+    sender: Sender<(String, String)>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+        let mut pending = Vec::new();
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    pending.extend_from_slice(&buffer[..read]);
+                    if let Some(text) = decode_stream_pending(&mut pending, false) {
+                        let _ = sender.send((stream.to_string(), text));
+                    }
+                }
+                Err(err) => {
+                    let _ = sender.send((
+                        "stderr".to_string(),
+                        format!("读取 {stream} 输出失败: {err}"),
+                    ));
+                    break;
+                }
+            }
+        }
+        if let Some(text) = decode_stream_pending(&mut pending, true) {
+            let _ = sender.send((stream.to_string(), text));
+        }
+    })
+}
+
+fn collect_stream_message(
+    app: Option<&tauri::AppHandle>,
+    action: &str,
+    stream: &str,
+    text: &str,
+    stdout: &mut String,
+    stderr: &mut String,
+) {
+    if stream == "stderr" {
+        stderr.push_str(text);
+    } else {
+        stdout.push_str(text);
+    }
+    emit_tool_progress(app, action, stream, text, false, None);
+}
+
+fn run_invocation_output_streaming(
+    app: Option<&tauri::AppHandle>,
+    action: &str,
+    invocation: &CommandInvocation,
+    command_label: &str,
+) -> Result<(String, String), String> {
+    emit_tool_progress(
+        app,
+        action,
+        "system",
+        format!("开始执行: {command_label}"),
+        false,
+        None,
+    );
+
+    let mut process = build_invocation_command(invocation);
+    process.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = process
+        .spawn()
+        .map_err(|err| format!("调用 {command_label} 失败: {err}"))?;
+
+    let (sender, receiver) = mpsc::channel::<(String, String)>();
+    let mut handles = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        handles.push(read_process_stream(stdout, "stdout", sender.clone()));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        handles.push(read_process_stream(stderr, "stderr", sender.clone()));
+    }
+    drop(sender);
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let status = loop {
+        while let Ok((stream, text)) = receiver.try_recv() {
+            collect_stream_message(app, action, &stream, &text, &mut stdout, &mut stderr);
+        }
+
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|err| format!("等待 {command_label} 失败: {err}"))?
+        {
+            break status;
+        }
+
+        thread::sleep(Duration::from_millis(80));
+    };
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    for (stream, text) in receiver.try_iter() {
+        collect_stream_message(app, action, &stream, &text, &mut stdout, &mut stderr);
+    }
+
+    let stdout = stdout.trim().to_string();
+    let stderr = stderr.trim().to_string();
+    if status.success() {
+        emit_tool_progress(app, action, "system", "命令已完成", true, Some(true));
+        Ok((stdout, stderr))
+    } else {
+        let message = if !stderr.is_empty() {
+            stderr.clone()
+        } else if !stdout.is_empty() {
+            stdout.clone()
+        } else {
+            format!("{command_label} 执行失败，但没有输出错误详情")
+        };
+        emit_tool_progress(app, action, "system", &message, true, Some(false));
+        Err(message)
     }
 }
 
@@ -793,30 +1120,13 @@ fn run_command_stdout_with_proxy(
     proxy_url: Option<&str>,
 ) -> Result<String, String> {
     let invocation = command_invocation_with_proxy(command, args, proxy_url);
-    let mut process = Command::new(&invocation.program);
-    process.args(&invocation.args);
-    for (key, value) in &invocation.env {
-        process.env(key, value);
-    }
-    let output = process
-        .output()
-        .map_err(|err| format!("调用 {command} 失败: {err}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if output.status.success() {
-        Ok(stdout)
-    } else if !stderr.is_empty() {
-        Err(stderr)
-    } else if !stdout.is_empty() {
-        Err(stdout)
-    } else {
-        Err(format!("{command} 执行失败，但没有输出错误详情"))
-    }
+    let (stdout, _) = run_invocation_output(&invocation, command)?;
+    Ok(stdout)
 }
 
-fn codex_paths() -> Vec<String> {
+fn executable_paths(command: &str) -> Vec<String> {
     if cfg!(target_os = "windows") {
-        run_command_stdout("where.exe", &["codex"])
+        run_command_stdout("where.exe", &[command])
             .map(|stdout| {
                 stdout
                     .lines()
@@ -827,15 +1137,56 @@ fn codex_paths() -> Vec<String> {
             })
             .unwrap_or_default()
     } else {
-        run_command_stdout("which", &["codex"])
+        run_command_stdout("which", &[command])
             .map(|stdout| vec![stdout])
             .unwrap_or_default()
     }
 }
 
+fn tool_status(name: &str, command: &str, version_args: &[&str]) -> ToolStatus {
+    let executable_paths = executable_paths(command);
+    if executable_paths.is_empty() {
+        return ToolStatus {
+            installed: false,
+            version: None,
+            executable_paths,
+            warning: Some(format!("未找到 {command} 可执行文件")),
+            message: format!("未安装 {name}"),
+        };
+    }
+
+    match run_command_stdout(command, version_args) {
+        Ok(version_output) => ToolStatus {
+            installed: true,
+            version: Some(version_output.trim().to_string()),
+            executable_paths,
+            warning: None,
+            message: format!("已检测到 {name}"),
+        },
+        Err(err) => ToolStatus {
+            installed: false,
+            version: None,
+            executable_paths,
+            warning: Some(err),
+            message: format!("{name} 检测失败"),
+        },
+    }
+}
+
+fn check_toolchain_status() -> ToolchainStatus {
+    ToolchainStatus {
+        node: tool_status("Node.js", "node", &["--version"]),
+        npm: tool_status("npm", "npm", &["--version"]),
+    }
+}
+
 fn local_codex_result() -> Result<(String, Vec<String>), String> {
+    let paths = executable_paths("codex");
+    if paths.is_empty() {
+        return Err("未找到 codex 可执行文件，请先安装 Codex CLI".to_string());
+    }
     let version_output = run_command_stdout("codex", &["--version"])?;
-    Ok((version_output, codex_paths()))
+    Ok((version_output, paths))
 }
 
 fn latest_codex_result(proxy_url: Option<&str>) -> Result<String, String> {
@@ -888,8 +1239,22 @@ fn codex_status_from_results(
     }
 }
 
-fn check_codex_status(proxy_url: Option<&str>) -> CodexStatus {
-    codex_status_from_results(local_codex_result(), latest_codex_result(proxy_url))
+fn check_codex_status(proxy_url: Option<&str>, npm_installed: bool) -> CodexStatus {
+    let latest_result = if npm_installed {
+        latest_codex_result(proxy_url)
+    } else {
+        Err("npm 未安装，无法检测 Codex 最新版本".to_string())
+    };
+    codex_status_from_results(local_codex_result(), latest_result)
+}
+
+fn check_runtime_status(settings: &AppSettings) -> RuntimeStatus {
+    let toolchain_status = check_toolchain_status();
+    let codex_status = check_codex_status(tool_proxy_url(settings), toolchain_status.npm.installed);
+    RuntimeStatus {
+        toolchain_status,
+        codex_status,
+    }
 }
 
 fn selected_profile_path(shell_status: &ShellStatus) -> PathBuf {
@@ -916,12 +1281,13 @@ fn load_app_state() -> Result<AppState, String> {
         initialize_profile_if_needed(&profile_path, &profile, &settings)?;
     save_settings_to_disk(&settings)?;
     let profile_status = profile_status_for(&profile_path, &initialized_profile);
-    let codex_status = check_codex_status(Some(&settings.proxy_url));
+    let runtime_status = check_runtime_status(&settings);
     Ok(AppState {
         settings,
         shell_status,
         profile_status,
-        codex_status,
+        toolchain_status: runtime_status.toolchain_status,
+        codex_status: runtime_status.codex_status,
     })
 }
 
@@ -966,38 +1332,87 @@ fn repair_profile(settings: AppSettings) -> Result<RepairResult, String> {
 }
 
 #[tauri::command]
-fn refresh_codex_status(proxy_url: Option<String>) -> Result<CodexStatus, String> {
-    Ok(check_codex_status(proxy_url.as_deref()))
+fn refresh_runtime_status(settings: AppSettings) -> Result<RuntimeStatus, String> {
+    Ok(check_runtime_status(&settings))
+}
+
+fn tool_action_result_with_runtime(
+    message: &str,
+    stdout: String,
+    stderr: String,
+    runtime_status: RuntimeStatus,
+) -> Result<UpdateResult, String> {
+    Ok(UpdateResult {
+        message: message.to_string(),
+        stdout,
+        stderr,
+        toolchain_status: runtime_status.toolchain_status,
+        codex_status: runtime_status.codex_status,
+    })
+}
+
+fn codex_update_completion_message(runtime_status: &RuntimeStatus) -> &'static str {
+    if runtime_status.codex_status.local_version.is_some() {
+        "Codex 更新命令已完成"
+    } else {
+        "Codex 更新命令已结束，但仍未检测到 Codex CLI。请查看安装日志，确认 codex 是否在 PATH 中。"
+    }
+}
+
+fn codex_install_completion_message(runtime_status: &RuntimeStatus) -> &'static str {
+    if runtime_status.codex_status.local_version.is_some() {
+        "Codex CLI 安装命令已完成"
+    } else if !runtime_status.toolchain_status.npm.installed {
+        "Codex 安装命令已结束，但仍未检测到 npm。请先安装 Node.js / npm。"
+    } else {
+        "Codex 安装命令已结束，但仍未检测到 Codex CLI。请查看安装日志，确认 npm global bin 是否在 PATH 中；必要时重启 CX-Manager 或 PowerShell。"
+    }
+}
+
+fn node_install_completion_message(runtime_status: &RuntimeStatus) -> &'static str {
+    if runtime_status.toolchain_status.npm.installed {
+        "Node.js LTS 安装命令已完成"
+    } else {
+        "Node.js LTS 安装命令已结束，但仍未检测到 npm。请查看安装日志；如果刚安装成功，请重启 CX-Manager 后刷新。"
+    }
 }
 
 #[tauri::command]
-fn update_codex(proxy_url: Option<String>) -> Result<UpdateResult, String> {
-    let invocation = command_invocation_with_proxy("codex", &["update"], proxy_url.as_deref());
-    let mut process = Command::new(&invocation.program);
-    process.args(&invocation.args);
-    for (key, value) in &invocation.env {
-        process.env(key, value);
-    }
-    let output = process
-        .output()
-        .map_err(|err| format!("调用 codex update 失败: {err}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !output.status.success() {
-        return Err(if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
-            stdout
-        } else {
-            "codex update 执行失败，但没有输出错误详情".to_string()
-        });
-    }
-    Ok(UpdateResult {
-        message: "Codex 更新命令已完成".to_string(),
-        stdout,
-        stderr,
-        codex_status: check_codex_status(proxy_url.as_deref()),
-    })
+fn update_codex(app: tauri::AppHandle, settings: AppSettings) -> Result<UpdateResult, String> {
+    let invocation = command_invocation_with_proxy("codex", &["update"], tool_proxy_url(&settings));
+    let (stdout, stderr) =
+        run_invocation_output_streaming(Some(&app), "更新 Codex", &invocation, "codex update")?;
+    let runtime_status = check_runtime_status(&settings);
+    let message = codex_update_completion_message(&runtime_status);
+    tool_action_result_with_runtime(message, stdout, stderr, runtime_status)
+}
+
+#[tauri::command]
+fn install_codex(app: tauri::AppHandle, settings: AppSettings) -> Result<UpdateResult, String> {
+    let invocation = install_codex_invocation(tool_proxy_url(&settings));
+    let (stdout, stderr) = run_invocation_output_streaming(
+        Some(&app),
+        "安装 Codex CLI",
+        &invocation,
+        "npm install -g @openai/codex",
+    )?;
+    let runtime_status = check_runtime_status(&settings);
+    let message = codex_install_completion_message(&runtime_status);
+    tool_action_result_with_runtime(message, stdout, stderr, runtime_status)
+}
+
+#[tauri::command]
+fn install_nodejs(app: tauri::AppHandle, settings: AppSettings) -> Result<UpdateResult, String> {
+    let invocation = install_nodejs_invocation(tool_proxy_url(&settings));
+    let (stdout, stderr) = run_invocation_output_streaming(
+        Some(&app),
+        "安装 Node.js LTS / npm",
+        &invocation,
+        "winget install OpenJS.NodeJS.LTS",
+    )?;
+    let runtime_status = check_runtime_status(&settings);
+    let message = node_install_completion_message(&runtime_status);
+    tool_action_result_with_runtime(message, stdout, stderr, runtime_status)
 }
 
 pub fn run() {
@@ -1007,8 +1422,10 @@ pub fn run() {
             load_app_state,
             save_app_state,
             repair_profile,
-            refresh_codex_status,
-            update_codex
+            refresh_runtime_status,
+            update_codex,
+            install_codex,
+            install_nodejs
         ])
         .run(tauri::generate_context!())
         .expect("error while running CX-Manager");
@@ -1025,6 +1442,7 @@ mod tests {
 
         assert_eq!(settings.target_shell, TargetShell::Auto);
         assert_eq!(settings.proxy_url, "http://10.20.34.92:7890");
+        assert!(settings.use_proxy_for_tools);
         assert!(settings.project_roots.is_empty());
     }
 
@@ -1073,6 +1491,7 @@ mod tests {
         let settings = AppSettings {
             target_shell: TargetShell::Powershell,
             proxy_url: "http://10.20.34.92:7890".to_string(),
+            use_proxy_for_tools: true,
             project_roots: Vec::new(),
         };
 
@@ -1332,6 +1751,133 @@ function Show-CXMenu {
                 Some("http://10.20.34.92:7890")
             );
         }
+    }
+
+    #[test]
+    fn tool_proxy_setting_can_disable_proxy_env() {
+        let settings = AppSettings {
+            target_shell: TargetShell::Auto,
+            proxy_url: "http://10.20.34.92:7890".to_string(),
+            use_proxy_for_tools: false,
+            project_roots: Vec::new(),
+        };
+
+        assert_eq!(tool_proxy_url(&settings), None);
+        assert!(install_codex_invocation(tool_proxy_url(&settings))
+            .env
+            .is_empty());
+        assert!(install_nodejs_invocation(tool_proxy_url(&settings))
+            .env
+            .is_empty());
+    }
+
+    #[test]
+    fn install_invocations_use_proxy_when_enabled() {
+        let settings = AppSettings {
+            target_shell: TargetShell::Auto,
+            proxy_url: "http://10.20.34.92:7890".to_string(),
+            use_proxy_for_tools: true,
+            project_roots: Vec::new(),
+        };
+
+        let codex = install_codex_invocation(tool_proxy_url(&settings));
+        assert!(codex.args.iter().any(|arg| arg == "@openai/codex"));
+        assert!(codex
+            .env
+            .iter()
+            .any(|(key, value)| key == "HTTPS_PROXY" && value == "http://10.20.34.92:7890"));
+
+        let node = install_nodejs_invocation(tool_proxy_url(&settings));
+        assert!(node.args.iter().any(|arg| arg == "OpenJS.NodeJS.LTS"));
+        assert!(node
+            .env
+            .iter()
+            .any(|(key, value)| key == "HTTPS_PROXY" && value == "http://10.20.34.92:7890"));
+    }
+
+    #[test]
+    fn installer_invocations_hide_external_console_windows_on_windows() {
+        let settings = AppSettings::default();
+
+        for invocation in [
+            install_codex_invocation(tool_proxy_url(&settings)),
+            install_nodejs_invocation(tool_proxy_url(&settings)),
+            command_invocation_with_proxy("codex", &["update"], tool_proxy_url(&settings)),
+        ] {
+            assert_eq!(invocation.hide_window, cfg!(target_os = "windows"));
+        }
+    }
+
+    fn tool_status_for_test(installed: bool, name: &str) -> ToolStatus {
+        ToolStatus {
+            installed,
+            version: installed.then(|| "1.0.0".to_string()),
+            executable_paths: if installed {
+                vec![format!("C:\\Tools\\{name}.cmd")]
+            } else {
+                Vec::new()
+            },
+            warning: None,
+            message: name.to_string(),
+        }
+    }
+
+    fn runtime_status_for_test(npm_installed: bool, codex_version: Option<&str>) -> RuntimeStatus {
+        RuntimeStatus {
+            toolchain_status: ToolchainStatus {
+                node: tool_status_for_test(npm_installed, "node"),
+                npm: tool_status_for_test(npm_installed, "npm"),
+            },
+            codex_status: CodexStatus {
+                executable_paths: codex_version
+                    .map(|_| vec!["C:\\Tools\\codex.cmd".to_string()])
+                    .unwrap_or_default(),
+                local_version: codex_version.map(ToOwned::to_owned),
+                latest_version: Some("0.137.0".to_string()),
+                update_available: false,
+                warning: None,
+                message: "test".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn install_completion_messages_explain_failed_post_install_detection() {
+        let npm_without_codex = runtime_status_for_test(true, None);
+        assert!(codex_install_completion_message(&npm_without_codex)
+            .contains("仍未检测到 Codex CLI"));
+        assert!(codex_install_completion_message(&npm_without_codex).contains("PATH"));
+
+        let no_npm = runtime_status_for_test(false, None);
+        assert!(codex_install_completion_message(&no_npm).contains("仍未检测到 npm"));
+        assert!(node_install_completion_message(&no_npm).contains("仍未检测到 npm"));
+
+        let installed = runtime_status_for_test(true, Some("0.137.0"));
+        assert_eq!(
+            codex_install_completion_message(&installed),
+            "Codex CLI 安装命令已完成"
+        );
+    }
+
+    #[test]
+    fn gbk_command_output_is_decoded_for_windows_errors() {
+        let bytes = [0xB2, 0xBB, 0xCA, 0xC7];
+
+        assert_eq!(decode_command_output(&bytes), "不是");
+    }
+
+    #[test]
+    fn stream_decoder_preserves_split_utf8_output() {
+        let mut pending = vec![0xE4, 0xBD];
+
+        assert_eq!(decode_stream_pending(&mut pending, false), None);
+        pending.push(0xA0);
+
+        assert_eq!(
+            decode_stream_pending(&mut pending, false).as_deref(),
+            Some("你")
+        );
+        assert!(pending.is_empty());
     }
 
     #[test]

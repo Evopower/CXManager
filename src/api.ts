@@ -1,5 +1,5 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
-import { AppState, CodexStatus, RepairResult, SaveResult, UpdateResult } from "./types";
+import { AppState, CodexStatus, RepairResult, RuntimeStatus, SaveResult, ToolchainStatus, UpdateResult } from "./types";
 
 const isTauriRuntime = () => "__TAURI_INTERNALS__" in window;
 const demoHome = "C:\\Users\\Example";
@@ -7,16 +7,34 @@ const demoHome = "C:\\Users\\Example";
 const demoCodexStatus: CodexStatus = {
   executablePaths: ["C:\\Program Files\\nodejs\\codex.cmd"],
   localVersion: "0.136.0",
-  latestVersion: "0.136.0",
-  updateAvailable: false,
+  latestVersion: "0.137.0",
+  updateAvailable: true,
   warning: null,
-  message: "Codex 已是最新版本: 0.136.0"
+  message: "Codex 可更新: 0.136.0 -> 0.137.0"
+};
+
+const demoToolchainStatus: ToolchainStatus = {
+  node: {
+    installed: true,
+    version: "v22.20.0",
+    executablePaths: ["C:\\Program Files\\nodejs\\node.exe"],
+    warning: null,
+    message: "已检测到 Node.js"
+  },
+  npm: {
+    installed: true,
+    version: "10.9.3",
+    executablePaths: ["C:\\Program Files\\nodejs\\npm.cmd"],
+    warning: null,
+    message: "已检测到 npm"
+  }
 };
 
 const demoState: AppState = {
   settings: {
     targetShell: "pwsh",
     proxyUrl: "http://10.20.34.92:7890",
+    useProxyForTools: true,
     projectRoots: [`${demoHome}\\PycharmProjects`]
   },
   shellStatus: {
@@ -35,6 +53,7 @@ const demoState: AppState = {
     isComplete: true,
     message: "Profile 已包含 CX-Manager 必要配置"
   },
+  toolchainStatus: demoToolchainStatus,
   codexStatus: demoCodexStatus
 };
 
@@ -65,15 +84,19 @@ export async function invokeCommand<T>(command: string, args?: Record<string, un
     } satisfies RepairResult as T;
   }
 
-  if (command === "refresh_codex_status") {
-    return demoCodexStatus as T;
+  if (command === "refresh_runtime_status") {
+    return {
+      toolchainStatus: demoToolchainStatus,
+      codexStatus: demoCodexStatus
+    } satisfies RuntimeStatus as T;
   }
 
-  if (command === "update_codex") {
+  if (command === "update_codex" || command === "install_codex" || command === "install_nodejs") {
     return {
-      message: "浏览器预览模式：更新命令只在 Tauri 桌面端执行",
+      message: "浏览器预览模式：安装和更新命令只在 Tauri 桌面端执行",
       stdout: "",
       stderr: "",
+      toolchainStatus: demoToolchainStatus,
       codexStatus: demoCodexStatus
     } satisfies UpdateResult as T;
   }
